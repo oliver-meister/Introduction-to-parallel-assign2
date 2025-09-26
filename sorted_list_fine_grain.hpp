@@ -1,5 +1,6 @@
 #ifndef lacpp_sorted_list_hpp
 #define lacpp_sorted_list_hpp lacpp_sorted_list_hpp
+#include <mutex>
 
 /* a sorted list implementation by David Klaftenegger, 2015
  * please report bugs or suggest improvements to david.klaftenegger@it.uu.se
@@ -23,18 +24,42 @@ class TATAS{
 		}
 };
 
+class Qnode{
+	public:
+		std::atomic<bool> locked{false};
+};
+
+class CLHLock{
+	std::atomic<Qnode*> tail;
+	inline static thread_local Qnode* myNode = new Qnode{};
+	inline static thread_local Qnode* pred = nullptr;
+	public:
+		void lock(){
+			myNode->locked.store(true, std::memory_order_relaxed);
+			pred = tail.exchange(myNode, std::memory_order_acq_rel);
+			while (pred->locked.load(std::memory_order_acquire)) {}
+
+		}
+		void unlock(){
+			myNode->locked.store(false, std::memory_order_release);
+			myNode = pred;
+		}
+};
+
 /* struct for list nodes */
 template<typename T>
 struct node {
 	T value;
 	node<T>* next;
+	CLHLock m;
 };
+
 
 /* non-concurrent sorted singly-linked list */
 template<typename T>
 class sorted_list {
 	node<T>* first = nullptr;
-	TATAS tatas;
+	CLHLock first_m;
 
 	public:
 		/* default implementations:
@@ -60,12 +85,23 @@ class sorted_list {
 		/* insert v into the list */
 		void insert(T v) {
 			/* first find position */
-			tatas.lock();
 			node<T>* pred = nullptr;
+			node<T>* garbage = nullptr;
+			bool has_first = false;
+			first_m.lock();
+			has_first = true;
+			if(first) first->m.lock();
 			node<T>* succ = first;
 			while(succ != nullptr && succ->value < v) {
+				garbage = pred;
 				pred = succ;
+				if(succ->next) succ->next->m.lock();
 				succ = succ->next;
+				if(garbage) garbage->m.unlock();
+				if (has_first && pred != nullptr) {
+            		first_m.unlock();
+            		has_first = false;
+        		}
 			}
 			
 			/* construct new node */
@@ -76,51 +112,100 @@ class sorted_list {
 			current->next = succ;
 			if(pred == nullptr) {
 				first = current;
+				if (has_first) { first_m.unlock(); has_first = false; }
 			} else {
 				pred->next = current;
 			}
-			tatas.unlock();
+			if(succ) succ->m.unlock();
+			if(pred) pred->m.unlock();
+			if(has_first) first_m.unlock();
 		}
 
 		void remove(T v) {
 			/* first find position */
-			tatas.lock();
 			node<T>* pred = nullptr;
+			node<T>* next = nullptr;
+			node<T>* garbage = nullptr;
+			bool has_first = false;
+			first_m.lock();
+			has_first = true;
+			if(first)
+			{
+				first->m.lock();
+				if(first->next) first->next->m.lock();
+				next = first -> next;
+			}
 			node<T>* current = first;
+
 			while(current != nullptr && current->value < v) {
+				garbage = pred;
 				pred = current;
-				current = current->next;
+				current = next;
+				if(current) 
+				{
+					if(current->next)current->next->m.lock();
+					next = current->next;
+				}else next = nullptr;
+
+				if(garbage) garbage->m.unlock();
+
+				if (has_first && pred != nullptr) {
+            		first_m.unlock();
+					has_first = false;
+        		}
 			}
 			if(current == nullptr || current->value != v) {
 				/* v not found */
-				tatas.unlock();
+				if(next) next->m.unlock();
+				if(current) current->m.unlock();
+				if(pred) pred->m.unlock();
+				if(has_first) first_m.unlock();
 				return;
 			}
 			/* remove current */
 			if(pred == nullptr) {
 				first = current->next;
+				if (has_first) { first_m.unlock(); has_first = false; }
 			} else {
 				pred->next = current->next;
 			}
+			if(next) next->m.unlock();
+			current->m.unlock();
+			if(pred) pred->m.unlock();
 			delete current;
-			tatas.unlock();
+			if(has_first)first_m.unlock();
 		}
 
 		/* count elements with value v in the list */
 		std::size_t count(T v) {
-			tatas.lock();
 			std::size_t cnt = 0;
+			bool has_first = false;
 			/* first go to value v */
+			first_m.lock();
+			has_first = true;
+			if(first){
+				first->m.lock();
+				first_m.unlock();
+				has_first = false;
+			}
 			node<T>* current = first;
+			node<T>* garbage = nullptr;
 			while(current != nullptr && current->value < v) {
+				garbage = current;
+				if(current->next) current->next->m.lock();
 				current = current->next;
+				garbage->m.unlock();
 			}
 			/* count elements */
 			while(current != nullptr && current->value == v) {
 				cnt++;
+				garbage = current;
+				if(current->next) current->next->m.lock();
 				current = current->next;
+				garbage->m.unlock();
 			}
-			tatas.unlock();
+			if(current) current->m.unlock();
+			if(has_first) first_m.unlock();
 			return cnt;
 		}
 };
